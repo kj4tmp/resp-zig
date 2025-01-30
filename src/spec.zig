@@ -46,6 +46,53 @@ const RESPType = union(DataType) {
     push: []const RESPType,
 };
 
+/// Call deinit() on this to free it.
+pub fn Decoded(comptime T: type) type {
+    return struct {
+        arena: *std.heap.ArenaAllocator,
+        value: T,
+        pub fn deinit(self: @This()) void {
+            const allocator = self.arena.child_allocator;
+            self.arena.deinit();
+            allocator.destroy(self.arena);
+        }
+    };
+}
+
+pub fn decodeAlloc(allocator: std.mem.Allocator, reader: anytype) !RESPType {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const res = decodeRecursive(arena.allocator(), reader) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Invalid => return error.Invalid,
+        error.EndOfStream => return error.Invalid,
+    };
+    return Decoded(RESPType){ .arena = arena, .value = res };
+}
+
+/// This function doesn't free. The caller is responsible for using
+/// an arena.
+pub fn decodeRecursive(allocator: std.mem.Allocator, reader: anytype) !RESPType {
+    const byte = try reader.readByte();
+    const data_type = std.meta.intToEnum(DataType, byte) catch return error.Invalid;
+
+    switch (data_type) {
+        .integer => {
+            try std.
+            try std.fmt.parseInt(i64, buf: []const u8, 10)
+        },
+    }
+}
+
+test "decode integer" {
+    const data = ":-123\r\n";
+    const expected: RESPType = .{ .integer = -123 };
+    const slice = try encodeSlice(resp, &out);
+    try std.testing.expectEqualSlices(u8, expected, slice);
+}
+
 pub fn encodeSlice(value: RESPType, out: []u8) ![]u8 {
     var fbs = std.io.fixedBufferStream(out);
     try encodeRecursive(value, fbs.writer());
