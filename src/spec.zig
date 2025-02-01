@@ -5,9 +5,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const separator = "\r\n";
+pub const separator = "\r\n";
 
-const DataType = enum(u8) {
+pub const DataType = enum(u8) {
     simple_string = '+',
     simple_error = '-',
     integer = ':',
@@ -24,7 +24,7 @@ const DataType = enum(u8) {
     push = '>',
 };
 
-const RESPType = union(DataType) {
+pub const RESPType = union(DataType) {
     simple_string: []const u8,
     simple_error: []const u8,
     integer: i64,
