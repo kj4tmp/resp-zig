@@ -14,9 +14,9 @@ pub const Client = struct {
     pub fn hello(self: *Client, allocator: std.mem.Allocator) !void {
         const writer = self.stream.writer();
         const reader = self.stream.reader();
-        const command = spec.RESPType{ .array = &.{
-            spec.RESPType{ .bulk_string = "HELLO" },
-            spec.RESPType{ .bulk_string = "3" },
+        const command = spec.Value{ .array = &.{
+            spec.Value{ .bulk_string = "HELLO" },
+            spec.Value{ .bulk_string = "3" },
         } };
         try spec.encodeRecursive(command, writer);
 
