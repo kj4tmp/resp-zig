@@ -228,6 +228,127 @@ pub fn decodeRecursive(allocator: std.mem.Allocator, reader: anytype, max_size: 
     }
 }
 
+// TODO: better error naming
+
+/// Stream data from reader to writer for one RESP Value.
+/// Includes all the bytes in the RESP value, including all delimeters / separators.
+pub fn streamUntilEoResp(reader: anytype, writer: anytype) !void {
+    const byte = try reader.readByte();
+    const data_type = std.meta.intToEnum(DataType, byte) catch return error.InvalidRESP;
+    try writer.writeByte(byte);
+
+    return switch (data_type) {
+        .simple_string, .simple_error, .integer, .double, .big_number => {
+            try reader.streamUntilDelimiter(writer, '\r', null);
+            try writer.writeAll(separator);
+            try reader.skipBytes(1, .{});
+        },
+        .bulk_string, .bulk_error, .verbatim_string => {
+            var buf: [100]u8 = undefined;
+            const slice = try reader.readUntilDelimiter(&buf, '\r');
+            try writer.writeAll(slice);
+            try reader.skipBytes(1, .{});
+            try writer.writeAll(separator);
+            const length = try std.fmt.parseInt(i64, slice, 10);
+
+            // this is stupid
+            if (length == -1) {
+                return;
+            } else if (length < -1) return error.Invalid;
+
+            if (length > std.math.maxInt(usize)) return error.StreamTooLong;
+            assert(length <= std.math.maxInt(usize));
+            var limited = std.io.limitedReader(reader, @intCast(length));
+            const limited_reader = limited.reader();
+
+            var fifo = std.fifo.LinearFifo(u8, .{ .Static = 128 }).init();
+            try fifo.pump(limited_reader, writer);
+            try reader.skipBytes(2, .{});
+            try writer.writeAll(separator);
+        },
+        .array, .map, .set, .push => |tag| {
+            var buf: [100]u8 = undefined;
+            const slice = try reader.readUntilDelimiter(&buf, '\r');
+            try writer.writeAll(slice);
+            try reader.skipBytes(1, .{});
+            try writer.writeAll(separator);
+            const length = try std.fmt.parseInt(i64, slice, 10);
+
+            // this is stupid
+            if (length == -1) {
+                return;
+            } else if (length < -1) return error.Invalid;
+
+            if (length > std.math.maxInt(usize)) return error.StreamTooLong;
+            assert(length <= std.math.maxInt(usize));
+            for (0..@intCast(length)) |_| {
+                switch (tag) {
+                    .array, .set, .push => try streamUntilEoResp(reader, writer),
+                    .map => {
+                        try streamUntilEoResp(reader, writer);
+                        try streamUntilEoResp(reader, writer);
+                    },
+                    else => unreachable,
+                }
+            }
+        },
+        .null => {
+            try reader.skipBytes(2, .{});
+            try writer.writeAll(separator);
+        },
+        .bool => {
+            try writer.writeByte(try reader.readByte());
+            try reader.skipBytes(2, .{});
+            try writer.writeAll(separator);
+        },
+    };
+}
+
+test streamUntilEoResp {
+    const valid_resps: []const []const u8 = &.{
+        "+OK\r\n",
+        "-Error message\r\n",
+        "-ERR unknown command 'asdf'\r\n",
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+        ":0\r\n",
+        ":1000\r\n",
+        "$5\r\nhello\r\n",
+        "$0\r\n\r\n",
+        "*0\r\n",
+        "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n",
+        "*3\r\n:1\r\n:2\r\n:3\r\n",
+        "*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$5\r\nhello\r\n",
+        "*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Hello\r\n-World\r\n",
+        "_\r\n",
+        "$-1\r\n",
+        "*-1\r\n",
+        "*3\r\n$5\r\nhello\r\n$-1\r\n$5\r\nworld\r\n",
+        "#t\r\n",
+        "#f\r\n",
+        ",1.23\r\n",
+        ":10\r\n",
+        ",10\r\n",
+        ",inf\r\n",
+        ",-inf\r\n",
+        ",nan\r\n",
+        "(3492890328409238509324850943850943825024385\r\n",
+        "!21\r\nSYNTAX invalid syntax\r\n",
+        "=15\r\ntxt:Some string\r\n",
+        "%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n",
+    };
+
+    for (valid_resps) |resp| {
+        var buf: [1000]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const writer = fbs.writer();
+
+        var fbs_valid = std.io.fixedBufferStream(resp);
+        const reader = fbs_valid.reader();
+        try streamUntilEoResp(reader, writer);
+        try std.testing.expectEqualSlices(u8, resp, fbs.getWritten());
+    }
+}
+
 fn decodeElementCount(reader: anytype, int_type: type) !int_type {
     var buf: [100]u8 = undefined;
     const slice = try reader.readUntilDelimiter(&buf, '\r');
