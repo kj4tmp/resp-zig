@@ -71,7 +71,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, in: []const u8, max_size: usize
     errdefer arena.deinit();
     const res = decodeRecursive(arena.allocator(), reader, max_size) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Invalid, error.EndOfStream, error.StreamTooLong, error.InvalidCharacter, error.Overflow => return error.Invalid,
+        error.Invalid, error.EndOfStream, error.StreamTooLong, error.InvalidCharacter, error.Overflow, error.NoSpaceLeft => return error.Invalid,
     };
     if (try fbs.getPos() != try fbs.getEndPos()) return error.InvalidRESP;
     return Decoded(Value){ .arena = arena, .value = res };
@@ -79,7 +79,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, in: []const u8, max_size: usize
 
 /// This function doesn't free. The caller is responsible for using
 /// an arena.
-pub fn decodeRecursive(allocator: std.mem.Allocator, reader: anytype, max_size: usize) error{ OutOfMemory, Invalid, EndOfStream, StreamTooLong, InvalidCharacter, Overflow }!Value {
+pub fn decodeRecursive(allocator: std.mem.Allocator, reader: anytype, max_size: usize) !Value {
     const byte = try reader.readByte();
     const data_type = std.meta.intToEnum(DataType, byte) catch return error.Invalid;
 
@@ -102,8 +102,9 @@ pub fn decodeRecursive(allocator: std.mem.Allocator, reader: anytype, max_size: 
         },
         .integer => {
             var buf: [100]u8 = undefined;
-            const slice = try reader.readUntilDelimiter(&buf, '\r');
-            const int = try std.fmt.parseInt(i64, slice, 10);
+            var fbs = std.io.fixedBufferStream(&buf);
+            try reader.streamUntilDelimiter(fbs.writer(), '\r', null);
+            const int = try std.fmt.parseInt(i64, fbs.getWritten(), 10);
             try reader.skipBytes(1, .{});
             return Value{ .integer = int };
         },
@@ -150,13 +151,17 @@ pub fn decodeRecursive(allocator: std.mem.Allocator, reader: anytype, max_size: 
         },
         .double => {
             var buf: [100]u8 = undefined;
-            const slice = try reader.readUntilDelimiter(&buf, '\r');
-            const double = try std.fmt.parseFloat(f64, slice);
+            var fbs = std.io.fixedBufferStream(&buf);
+            try reader.streamUntilDelimiter(fbs.writer(), '\r', null);
+            const double = try std.fmt.parseFloat(f64, fbs.getWritten());
             try reader.skipBytes(1, .{});
             return Value{ .double = double };
         },
         .big_number => {
-            const slice = try reader.readUntilDelimiterAlloc(allocator, '\r', max_size);
+            var array_list = std.ArrayList(u8).init(allocator);
+            defer array_list.deinit();
+            try reader.streamUntilDelimiter(array_list.writer(), '\r', max_size);
+            const slice = try array_list.toOwnedSlice();
             try reader.skipBytes(1, .{});
             return Value{ .big_number = slice };
         },
