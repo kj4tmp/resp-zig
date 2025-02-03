@@ -21,9 +21,9 @@ pub const Client = struct {
         try spec.encodeRecursive(command, writer);
 
         var buf: [4096]u8 = undefined;
-        const num_bytes = try reader.read(&buf);
-        var fbs = std.io.fixedBufferStream(buf[0..num_bytes]);
-        const decoded = try spec.decodeAlloc(allocator, fbs.reader(), 256);
+        var fbs = std.io.fixedBufferStream(&buf);
+        try spec.streamUntilEoResp(reader, fbs.writer());
+        const decoded = try spec.decodeAlloc(allocator, fbs.getWritten(), 256);
         defer decoded.deinit();
 
         for (decoded.value.map) |kv| {

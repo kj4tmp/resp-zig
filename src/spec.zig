@@ -62,7 +62,9 @@ pub fn Decoded(comptime T: type) type {
     };
 }
 
-pub fn decodeAlloc(allocator: std.mem.Allocator, reader: anytype, max_size: usize) !Decoded(Value) {
+pub fn decodeAlloc(allocator: std.mem.Allocator, in: []const u8, max_size: usize) !Decoded(Value) {
+    var fbs = std.io.fixedBufferStream(in);
+    const reader = fbs.reader();
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -71,6 +73,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, reader: anytype, max_size: usiz
         error.OutOfMemory => return error.OutOfMemory,
         error.Invalid, error.EndOfStream, error.StreamTooLong, error.InvalidCharacter, error.Overflow => return error.Invalid,
     };
+    if (try fbs.getPos() != try fbs.getEndPos()) return error.InvalidRESP;
     return Decoded(Value){ .arena = arena, .value = res };
 }
 
@@ -82,12 +85,18 @@ pub fn decodeRecursive(allocator: std.mem.Allocator, reader: anytype, max_size: 
 
     switch (data_type) {
         .simple_string => {
-            const slice = try reader.readUntilDelimiterAlloc(allocator, '\r', max_size);
+            var array_list = std.ArrayList(u8).init(allocator);
+            defer array_list.deinit();
+            try reader.streamUntilDelimiter(array_list.writer(), '\r', max_size);
+            const slice = try array_list.toOwnedSlice();
             try reader.skipBytes(1, .{});
             return Value{ .simple_string = slice };
         },
         .simple_error => {
-            const slice = try reader.readUntilDelimiterAlloc(allocator, '\r', max_size);
+            var array_list = std.ArrayList(u8).init(allocator);
+            defer array_list.deinit();
+            try reader.streamUntilDelimiter(array_list.writer(), '\r', max_size);
+            const slice = try array_list.toOwnedSlice();
             try reader.skipBytes(1, .{});
             return Value{ .simple_error = slice };
         },
@@ -254,7 +263,7 @@ pub fn streamUntilEoResp(reader: anytype, writer: anytype) !void {
             // this is stupid
             if (length == -1) {
                 return;
-            } else if (length < -1) return error.Invalid;
+            } else if (length < -1) return error.InvalidRESP;
 
             if (length > std.math.maxInt(usize)) return error.StreamTooLong;
             assert(length <= std.math.maxInt(usize));
@@ -359,250 +368,201 @@ fn decodeElementCount(reader: anytype, int_type: type) !int_type {
 
 test "decode push" {
     const data = ">2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .push = &.{ Value{ .bulk_string = "hello" }, Value{ .bulk_string = "world" } } };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode set" {
     const data = "~2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .set = &.{ Value{ .bulk_string = "hello" }, Value{ .bulk_string = "world" } } };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode map" {
     const data = "%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .map = &.{
         .{ .key = Value{ .simple_string = "first" }, .value = Value{ .integer = 1 } },
         .{ .key = Value{ .simple_string = "second" }, .value = Value{ .integer = 2 } },
     } };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode invalid verbatim string as bulk string" {
     const data = "=3\r\ntxt\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .bulk_string = "txt" };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode empty verbatim string" {
     const data = "=4\r\ntxt:\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .verbatim_string = .{ .data = "", .encoding = .{ 't', 'x', 't' } } };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode verbatim string" {
     const data = "=15\r\ntxt:Some string\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .verbatim_string = .{ .data = "Some string", .encoding = .{ 't', 'x', 't' } } };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode bulk error" {
     const data = "!21\r\nSYNTAX invalid syntax\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .bulk_error = "SYNTAX invalid syntax" };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode bug number" {
     const data = "(3492890328409238509324850943850943825024385\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .big_number = "3492890328409238509324850943850943825024385" };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode nan" {
     const data = ",nan\r\n";
-    var stream = std.io.fixedBufferStream(data);
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expect(std.math.isNan(decoded.value.double));
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode -inf" {
     const data = ",-inf\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .double = -std.math.inf(f64) };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode inf" {
     const data = ",inf\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .double = std.math.inf(f64) };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode double" {
     const data = ",1.23\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .double = 1.23 };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode true" {
     const data = "#t\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .bool = true };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode false" {
     const data = "#f\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .bool = false };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode null" {
     const data = "_\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .null = {} };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode array" {
     const data = "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .array = &.{ Value{ .bulk_string = "hello" }, Value{ .bulk_string = "world" } } };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode empty array" {
     const data = "*0\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .array = &.{} };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode null array" {
     const data = "*-1\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .null = {} };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode empty string" {
     const data = "$0\r\n\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .bulk_string = "" };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode null bulk string" {
     const data = "$-1\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .null = {} };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode bulk string" {
     const data = "$5\r\nhello\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .bulk_string = "hello" };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode simple error" {
     const data = "-error message\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .simple_error = "error message" };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode simple string" {
     const data = "+OK\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .simple_string = "OK" };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode integer" {
     const data = ":-123\r\n";
-    var stream = std.io.fixedBufferStream(data);
     const expected: Value = .{ .integer = -123 };
-    const decoded = try decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded = try decodeAlloc(std.testing.allocator, data, 512);
     defer decoded.deinit();
     try std.testing.expectEqualDeep(expected, decoded.value);
-    try std.testing.expect(stream.pos == try stream.getEndPos());
 }
 
 test "decode invalid integer" {
     const data = ":-12333333333333333333333333333333333333333333333333333333333333\r\n";
-    var stream = std.io.fixedBufferStream(data);
-    const decoded_res = decodeAlloc(std.testing.allocator, stream.reader(), 512);
+    const decoded_res = decodeAlloc(std.testing.allocator, data, 512);
     try std.testing.expectError(error.Invalid, decoded_res);
 }
 
