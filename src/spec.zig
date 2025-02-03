@@ -259,7 +259,9 @@ pub fn streamUntilEoResp(reader: anytype, writer: anytype) !void {
         },
         .bulk_string, .bulk_error, .verbatim_string => {
             var buf: [100]u8 = undefined;
-            const slice = try reader.readUntilDelimiter(&buf, '\r');
+            var fbs = std.io.fixedBufferStream(&buf);
+            try reader.streamUntilDelimiter(fbs.writer(), '\r', null);
+            const slice = fbs.getWritten();
             try writer.writeAll(slice);
             try reader.skipBytes(1, .{});
             try writer.writeAll(separator);
@@ -282,11 +284,12 @@ pub fn streamUntilEoResp(reader: anytype, writer: anytype) !void {
         },
         .array, .map, .set, .push => |tag| {
             var buf: [100]u8 = undefined;
-            const slice = try reader.readUntilDelimiter(&buf, '\r');
-            try writer.writeAll(slice);
+            var fbs = std.io.fixedBufferStream(&buf);
+            try reader.streamUntilDelimiter(fbs.writer(), '\r', null);
+            try writer.writeAll(fbs.getWritten());
             try reader.skipBytes(1, .{});
             try writer.writeAll(separator);
-            const length = try std.fmt.parseInt(i64, slice, 10);
+            const length = try std.fmt.parseInt(i64, fbs.getWritten(), 10);
 
             // this is stupid
             if (length == -1) {
@@ -365,7 +368,9 @@ test streamUntilEoResp {
 
 fn decodeElementCount(reader: anytype, int_type: type) !int_type {
     var buf: [100]u8 = undefined;
-    const slice = try reader.readUntilDelimiter(&buf, '\r');
+    var fbs = std.io.fixedBufferStream(&buf);
+    try reader.streamUntilDelimiter(fbs.writer(), '\r', null);
+    const slice = fbs.getWritten();
     const int = try std.fmt.parseInt(int_type, slice, 10);
     try reader.skipBytes(1, .{});
     return int;
